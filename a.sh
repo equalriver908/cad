@@ -14,19 +14,17 @@ ADMIN_EMAIL="a.saeed@$DOMAIN"
 WP_PATH="/var/www/html"          # The original WordPress path (no backup needed)
 PHP_VERSION="8.3"
 PHP_SOCKET="/run/php/php${PHP_VERSION}-fpm.sock"
-
-# Database Configuration
-DB_NAME="sahmcore_wp"
-DB_USER="sahmcore_user"
-DB_PASS="SahmCore@2025"
 WP_CONFIG="$WP_PATH/wp-config.php"
+DB_NAME="sahmcore_wp"  # Adjust to your database name
+DB_USER="sahmcore_user"  # Adjust to your WordPress DB user
+DB_PASSWORD="SahmCore@2025"  # Database password
 
 # -------------------
 # SYSTEM UPDATE & DEPENDENCIES
 # -------------------
 echo "[INFO] Updating system and installing dependencies..."
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl wget unzip lsb-release software-properties-common net-tools ufw dnsutils git mariadb-client mariadb-server
+sudo apt install -y curl wget unzip lsb-release software-properties-common net-tools ufw dnsutils git mysql-client mysql-server
 
 # -------------------
 # PHP-FPM INSTALLATION
@@ -77,18 +75,6 @@ sudo find $WP_PATH -type d -exec chmod 755 {} \;
 sudo find $WP_PATH -type f -exec chmod 644 {} \;
 
 # -------------------
-# RESTORE DATABASE
-# -------------------
-echo "[INFO] Restoring database..."
-
-# If necessary, create the database (ensure the database exists in MySQL)
-sudo mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
-
-# Import the existing database dump (if applicable)
-# Adjust if you have an actual database dump to restore
-sudo mysql -u root -p $DB_NAME < /var/www/html/backup/wordpress_db.sql
-
-# -------------------
 # VERIFY wp-config.php
 # -------------------
 echo "[INFO] Verifying wp-config.php..."
@@ -97,12 +83,10 @@ if [ ! -f "$WP_CONFIG" ]; then
     exit 1
 fi
 
-# Update database credentials in wp-config.php
-sed -i "s/database_name_here/$DB_NAME/" $WP_CONFIG
-sed -i "s/username_here/$DB_USER/" $WP_CONFIG
-sed -i "s/password_here/$DB_PASS/" $WP_CONFIG
+# Ensure wp-config.php points to the correct database using Unix socket
+sed -i "s|define('DB_HOST', 'localhost');|define('DB_HOST', 'localhost:/var/run/mysqld/mysqld.sock');|" $WP_CONFIG
 
-# Update site URL
+# Update site URL if necessary
 sed -i "s|define('WP_HOME', 'http://localhost');|define('WP_HOME', 'https://$DOMAIN');|" $WP_CONFIG
 sed -i "s|define('WP_SITEURL', 'http://localhost');|define('WP_SITEURL', 'https://$DOMAIN');|" $WP_CONFIG
 
@@ -126,7 +110,53 @@ $DOMAIN, www.$DOMAIN {
         X-XSS-Protection "1; mode=block"
         Referrer-Policy "strict-origin-when-cross-origin"
     }
+    # Automatically get SSL certificates from Let's Encrypt
     tls $ADMIN_EMAIL
+}
+
+# ERP
+erp.$DOMAIN {
+    reverse_proxy http://$THIS_VM_IP:8069
+    log {
+        output file /var/log/caddy/erp.log
+    }
+}
+
+# Documentation
+docs.$DOMAIN {
+    reverse_proxy https://$THIS_VM_IP:9443
+    log {
+        output file /var/log/caddy/docs.log
+    }
+}
+
+# Mail
+mail.$DOMAIN {
+    reverse_proxy https://$THIS_VM_IP:444
+    log {
+        output file /var/log/caddy/mail.log
+    }
+}
+
+# Nomogrow
+nomogrow.$DOMAIN {
+    reverse_proxy http://$THIS_VM_IP:8082
+    log {
+        output file /var/log/caddy/nomogrow.log
+    }
+}
+
+# Ventura-Tech
+ventura-tech.$DOMAIN {
+    reverse_proxy http://$THIS_VM_IP:8080
+    log {
+        output file /var/log/caddy/ventura-tech.log
+    }
+}
+
+# HTTP redirect to HTTPS (for debugging)
+http://$DOMAIN, http://www.$DOMAIN, http://erp.$DOMAIN, http://docs.$DOMAIN, http://mail.$DOMAIN, http://nomogrow.$DOMAIN, http://ventura-tech.$DOMAIN {
+    redir https://{host}{uri} permanent
 }
 EOF
 
