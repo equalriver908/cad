@@ -1,7 +1,7 @@
 #!/bin/bash
 # ===============================================
 # Migration Script: WordPress + PHP-FPM + Caddy
-# Migrates WordPress from Apache/Nginx to Caddy with Let's Encrypt SSL
+# Migration & MySQL user reset with password fix
 # ===============================================
 
 set -e
@@ -89,19 +89,33 @@ sudo find $WP_PATH -type d -exec chmod 755 {} \;
 sudo find $WP_PATH -type f -exec chmod 644 {} \;
 
 # -------------------
-# RESTORE DATABASE
+# RESET MariaDB USER PASSWORD
 # -------------------
-echo "[INFO] Restoring database..."
+echo "[INFO] Resetting MariaDB user $DB_USER password and granting necessary privileges..."
 
-# If necessary, create the database (ensure the database exists in MySQL)
-echo "[INFO] Creating the database $DB_NAME if it doesn't exist..."
-sudo mysql -u $DB_USER -p$DB_PASS -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
+# Stop the MariaDB service
+sudo systemctl stop mariadb
 
-# Import the existing database dump (if applicable)
-# This assumes the original database is running and doesn't require restoring from an external file
-# Adjust if you have an actual database dump to restore
-echo "[INFO] Importing the database dump..."
-sudo mysql -u $DB_USER -p$DB_PASS $DB_NAME < /var/www/html/backup/wordpress_db.sql
+# Start MariaDB in safe mode (without the grant tables)
+echo "[INFO] Starting MariaDB in safe mode..."
+sudo mysqld_safe --skip-grant-tables &
+
+# Wait for MariaDB to start
+sleep 5
+
+# Log into MariaDB and reset the password
+echo "[INFO] Resetting password for $DB_USER..."
+mysql -u root <<EOF
+USE mysql;
+UPDATE user SET authentication_string=PASSWORD('$DB_PASS') WHERE User='$DB_USER' AND Host='localhost';
+GRANT ALL PRIVILEGES ON $DB_NAME.* TO '$DB_USER'@'localhost' IDENTIFIED BY '$DB_PASS';
+FLUSH PRIVILEGES;
+EXIT;
+EOF
+
+# Restart the MariaDB service
+echo "[INFO] Restarting MariaDB..."
+sudo systemctl restart mariadb
 
 # -------------------
 # VERIFY wp-config.php
@@ -143,77 +157,6 @@ $DOMAIN, www.$DOMAIN {
     }
     # Automatically get SSL certificates from Let's Encrypt
     tls $ADMIN_EMAIL
-}
-
-# ERP
-erp.$DOMAIN {
-    reverse_proxy http://$ERP_IP:$ERP_PORT {
-        header_up Host {host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote}
-    }
-    log {
-        output file /var/log/caddy/erp.log
-    }
-}
-
-# Documentation
-docs.$DOMAIN {
-    reverse_proxy https://$DOCS_IP:$DOCS_PORT {
-        transport http {
-            tls_insecure_skip_verify
-        }
-        header_up Host {host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote}
-    }
-    log {
-        output file /var/log/caddy/docs.log
-    }
-}
-
-# Mail
-mail.$DOMAIN {
-    reverse_proxy https://$MAIL_IP:$MAIL_PORT {
-        transport http {
-            tls_insecure_skip_verify
-        }
-        header_up Host {host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote}
-    }
-    log {
-        output file /var/log/caddy/mail.log
-    }
-}
-
-# Nomogrow
-nomogrow.$DOMAIN {
-    reverse_proxy http://$NOMOGROW_IP:$NOMOGROW_PORT {
-        header_up Host {host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote}
-    }
-    log {
-        output file /var/log/caddy/nomogrow.log
-    }
-}
-
-# Ventura-Tech
-ventura-tech.$DOMAIN {
-    reverse_proxy http://$VENTURA_IP:$VENTURA_PORT {
-        header_up Host {host}
-        header_up X-Forwarded-Proto {scheme}
-        header_up X-Forwarded-For {remote}
-    }
-    log {
-        output file /var/log/caddy/ventura-tech.log
-    }
-}
-
-# HTTP redirect to HTTPS (for debugging)
-http://$DOMAIN, http://www.$DOMAIN, http://erp.$DOMAIN, http://docs.$DOMAIN, http://mail.$DOMAIN, http://nomogrow.$DOMAIN, http://ventura-tech.$DOMAIN {
-    redir https://{host}{uri} permanent
 }
 EOF
 
@@ -264,22 +207,12 @@ else
 fi
 
 # Check if MySQL is accessible using the non-root user
-echo "[INFO] Testing MySQL connectivity..."
-mysql -u $DB_USER -p$DB_PASS -h localhost -e "SHOW DATABASES;" > /dev/null
+echo "[INFO] Testing MySQL connectivity with user $DB_USER..."
+mysql -u $DB_USER -p$DB_PASS -h localhost -e "USE $DB_NAME; SHOW TABLES;" > /dev/null
 if [ $? -eq 0 ]; then
-    echo "[INFO] MySQL connection is successful."
+    echo "[INFO] MySQL connection successful with user $DB_USER."
 else
-    echo "[ERROR] Unable to connect to MySQL. Check credentials and permissions."
-    exit 1
-fi
-
-# Validate that the correct database exists and has the necessary WordPress tables
-echo "[INFO] Checking that the WordPress database exists and has tables..."
-mysql -u $DB_USER -p$DB_PASS -e "USE $DB_NAME; SHOW TABLES;" > /dev/null
-if [ $? -eq 0 ]; then
-    echo "[INFO] Database $DB_NAME exists and contains tables."
-else
-    echo "[ERROR] Database $DB_NAME does not exist or does not contain the necessary tables!"
+    echo "[ERROR] Unable to connect to MySQL with $DB_USER."
     exit 1
 fi
 
@@ -298,4 +231,15 @@ sudo tail -n 20 /var/log/php8.3-fpm.log
 
 # Test if Caddy is properly serving WordPress (reverse proxy test)
 echo "[INFO] Checking reverse proxy (Caddy) for WordPress..."
-RESPONSE_CODE=$(curl -s -o /dev/null -w "%{
+RESPONSE_CODE=$(curl -s -o /dev/null -w "%{http_code}" https://$DOMAIN)
+if [ "$RESPONSE_CODE" -eq 200 ]; then
+    echo "[INFO] WordPress site is being served correctly through Caddy."
+else
+    echo "[ERROR] There is an issue with serving the WordPress site via Caddy. HTTP Status: $RESPONSE_CODE"
+    exit 1
+fi
+
+# -------------------
+# COMPLETION
+# -------------------
+echo "[INFO] Migration complete. The WordPress site should now be available at https://$DOMAIN."
