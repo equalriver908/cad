@@ -82,12 +82,12 @@ sudo find $WP_PATH -type f -exec chmod 644 {} \;
 echo "[INFO] Restoring database..."
 
 # If necessary, create the database (ensure the database exists in MySQL)
-sudo mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
+sudo mysql -u sahmcore_user -p -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
 
 # Import the existing database dump (if applicable)
 # This assumes the original database is running and doesn't require restoring from an external file
 # Adjust if you have an actual database dump to restore
-sudo mysql -u root -p $DB_NAME < /var/www/html/backup/wordpress_db.sql
+sudo mysql -u sahmcore_user -p $DB_NAME < /var/www/html/backup/wordpress_db.sql
 
 # -------------------
 # VERIFY wp-config.php
