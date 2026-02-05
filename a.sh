@@ -15,16 +15,18 @@ WP_PATH="/var/www/html"          # The original WordPress path (no backup needed
 PHP_VERSION="8.3"
 PHP_SOCKET="/run/php/php${PHP_VERSION}-fpm.sock"
 WP_CONFIG="$WP_PATH/wp-config.php"
-DB_NAME="sahmcore_wp"  # Adjust to your database name
-DB_USER="sahmcore_user"  # Adjust to your WordPress DB user
-DB_PASSWORD="SahmCore@2025"  # Database password
+
+# MySQL Credentials
+DB_NAME="sahmcore_wp"
+DB_USER="sahmcore_user"
+DB_PASS="SahmCore@2025"
 
 # -------------------
 # SYSTEM UPDATE & DEPENDENCIES
 # -------------------
 echo "[INFO] Updating system and installing dependencies..."
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y curl wget unzip lsb-release software-properties-common net-tools ufw dnsutils git mysql-client mysql-server
+sudo apt install -y curl wget unzip lsb-release software-properties-common net-tools ufw dnsutils git mariadb-client mariadb-server
 
 # -------------------
 # PHP-FPM INSTALLATION
@@ -75,6 +77,19 @@ sudo find $WP_PATH -type d -exec chmod 755 {} \;
 sudo find $WP_PATH -type f -exec chmod 644 {} \;
 
 # -------------------
+# RESTORE DATABASE
+# -------------------
+echo "[INFO] Restoring database..."
+
+# If necessary, create the database (ensure the database exists in MySQL)
+sudo mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
+
+# Import the existing database dump (if applicable)
+# This assumes the original database is running and doesn't require restoring from an external file
+# Adjust if you have an actual database dump to restore
+sudo mysql -u root -p $DB_NAME < /var/www/html/backup/wordpress_db.sql
+
+# -------------------
 # VERIFY wp-config.php
 # -------------------
 echo "[INFO] Verifying wp-config.php..."
@@ -83,8 +98,10 @@ if [ ! -f "$WP_CONFIG" ]; then
     exit 1
 fi
 
-# Ensure wp-config.php points to the correct database using Unix socket
-sed -i "s|define('DB_HOST', 'localhost');|define('DB_HOST', 'localhost:/var/run/mysqld/mysqld.sock');|" $WP_CONFIG
+# Ensure wp-config.php points to the correct database
+sed -i "s/database_name_here/$DB_NAME/" $WP_CONFIG
+sed -i "s/username_here/$DB_USER/" $WP_CONFIG
+sed -i "s/password_here/$DB_PASS/" $WP_CONFIG
 
 # Update site URL if necessary
 sed -i "s|define('WP_HOME', 'http://localhost');|define('WP_HOME', 'https://$DOMAIN');|" $WP_CONFIG
@@ -114,50 +131,7 @@ $DOMAIN, www.$DOMAIN {
     tls $ADMIN_EMAIL
 }
 
-# ERP
-erp.$DOMAIN {
-    reverse_proxy http://$THIS_VM_IP:8069
-    log {
-        output file /var/log/caddy/erp.log
-    }
-}
-
-# Documentation
-docs.$DOMAIN {
-    reverse_proxy https://$THIS_VM_IP:9443
-    log {
-        output file /var/log/caddy/docs.log
-    }
-}
-
-# Mail
-mail.$DOMAIN {
-    reverse_proxy https://$THIS_VM_IP:444
-    log {
-        output file /var/log/caddy/mail.log
-    }
-}
-
-# Nomogrow
-nomogrow.$DOMAIN {
-    reverse_proxy http://$THIS_VM_IP:8082
-    log {
-        output file /var/log/caddy/nomogrow.log
-    }
-}
-
-# Ventura-Tech
-ventura-tech.$DOMAIN {
-    reverse_proxy http://$THIS_VM_IP:8080
-    log {
-        output file /var/log/caddy/ventura-tech.log
-    }
-}
-
-# HTTP redirect to HTTPS (for debugging)
-http://$DOMAIN, http://www.$DOMAIN, http://erp.$DOMAIN, http://docs.$DOMAIN, http://mail.$DOMAIN, http://nomogrow.$DOMAIN, http://ventura-tech.$DOMAIN {
-    redir https://{host}{uri} permanent
-}
+# Other services (ERP, docs, mail, etc.) can be added here as needed
 EOF
 
 # -------------------
@@ -183,29 +157,11 @@ sudo systemctl enable --now caddy
 # -------------------
 # DIAGNOSTIC SCRIPT
 # -------------------
-echo "[INFO] Starting diagnostic check..."
 
-# Check for Apache and Nginx conflicts
-echo "[INFO] Checking if Apache or Nginx are running..."
-if systemctl is-active --quiet apache2; then
-    echo "[ERROR] Apache is running. Stopping and disabling..."
-    sudo systemctl stop apache2
-    sudo systemctl disable apache2
-    sudo systemctl mask apache2
-else
-    echo "[INFO] Apache is not running."
-fi
-if systemctl is-active --quiet nginx; then
-    echo "[ERROR] Nginx is running. Stopping and disabling..."
-    sudo systemctl stop nginx
-    sudo systemctl disable nginx
-    sudo systemctl mask nginx
-else
-    echo "[INFO] Nginx is not running."
-fi
+echo "[INFO] Running diagnostics..."
 
 # Check if PHP-FPM is running
-echo "[INFO] Checking if PHP-FPM is running..."
+echo "[INFO] Checking PHP-FPM service..."
 if systemctl is-active --quiet php${PHP_VERSION}-fpm; then
     echo "[INFO] PHP-FPM is running."
 else
@@ -224,7 +180,42 @@ else
     sudo systemctl enable caddy
 fi
 
+# Check if MySQL is accessible
+echo "[INFO] Testing MySQL connectivity..."
+mysql -u $DB_USER -p$DB_PASS -h localhost -e "SHOW DATABASES;" > /dev/null
+if [ $? -eq 0 ]; then
+    echo "[INFO] MySQL connection is successful."
+else
+    echo "[ERROR] Unable to connect to MySQL. Check credentials and permissions."
+    exit 1
+fi
+
+# Check if PHP-FPM socket exists and is accessible
+echo "[INFO] Checking PHP-FPM socket..."
+if [ -S "$PHP_SOCKET" ]; then
+    echo "[INFO] PHP-FPM socket exists and is accessible."
+else
+    echo "[ERROR] PHP-FPM socket is missing or inaccessible!"
+    exit 1
+fi
+
+# Test the PHP-FPM log for errors
+echo "[INFO] Checking PHP-FPM logs for errors..."
+sudo tail -n 20 /var/log/php8.3-fpm.log
+
+# Test if Caddy is properly serving WordPress
+echo "[INFO] Testing WordPress with Curl..."
+curl -s --head "https://$DOMAIN" | head -n 20
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN")
+if [ "$HTTP_STATUS" -eq 200 ]; then
+    echo "[INFO] WordPress is responsive (status code 200)."
+else
+    echo "[ERROR] WordPress is not responsive (status code: $HTTP_STATUS)."
+    exit 1
+fi
+
 # -------------------
 # COMPLETION
 # -------------------
 echo "[INFO] Migration complete. The WordPress site should now be available at https://$DOMAIN"
+
