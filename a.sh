@@ -15,6 +15,18 @@ WP_PATH="/var/www/html"          # The original WordPress path (no backup needed
 PHP_VERSION="8.3"
 PHP_SOCKET="/run/php/php${PHP_VERSION}-fpm.sock"
 WP_CONFIG="$WP_PATH/wp-config.php"
+# Internal VM IPs
+THIS_VM_IP="192.168.116.37"
+ERP_IP="192.168.116.13"
+ERP_PORT="8069"
+DOCS_IP="192.168.116.1"
+DOCS_PORT="9443"
+MAIL_IP="192.168.116.1"
+MAIL_PORT="444"
+NOMOGROW_IP="192.168.116.48"
+NOMOGROW_PORT="8082"
+VENTURA_IP="192.168.116.10"
+VENTURA_PORT="8080"
 
 # MySQL Credentials
 DB_NAME="sahmcore_wp"
@@ -82,12 +94,14 @@ sudo find $WP_PATH -type f -exec chmod 644 {} \;
 echo "[INFO] Restoring database..."
 
 # If necessary, create the database (ensure the database exists in MySQL)
-sudo mysql -u sahmcore_user -p -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
+echo "[INFO] Creating the database $DB_NAME if it doesn't exist..."
+sudo mysql -u $DB_USER -p$DB_PASS -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
 
 # Import the existing database dump (if applicable)
 # This assumes the original database is running and doesn't require restoring from an external file
 # Adjust if you have an actual database dump to restore
-sudo mysql -u sahmcore_user -p $DB_NAME < /var/www/html/backup/wordpress_db.sql
+echo "[INFO] Importing the database dump..."
+sudo mysql -u $DB_USER -p$DB_PASS $DB_NAME < /var/www/html/backup/wordpress_db.sql
 
 # -------------------
 # VERIFY wp-config.php
@@ -99,13 +113,13 @@ if [ ! -f "$WP_CONFIG" ]; then
 fi
 
 # Ensure wp-config.php points to the correct database
-sed -i "s/database_name_here/$DB_NAME/" $WP_CONFIG
-sed -i "s/username_here/$DB_USER/" $WP_CONFIG
-sed -i "s/password_here/$DB_PASS/" $WP_CONFIG
+sudo sed -i "s/database_name_here/$DB_NAME/" $WP_CONFIG
+sudo sed -i "s/username_here/$DB_USER/" $WP_CONFIG
+sudo sed -i "s/password_here/$DB_PASS/" $WP_CONFIG
 
 # Update site URL if necessary
-sed -i "s|define('WP_HOME', 'http://localhost');|define('WP_HOME', 'https://$DOMAIN');|" $WP_CONFIG
-sed -i "s|define('WP_SITEURL', 'http://localhost');|define('WP_SITEURL', 'https://$DOMAIN');|" $WP_CONFIG
+sudo sed -i "s|define('WP_HOME', 'http://localhost');|define('WP_HOME', 'https://$DOMAIN');|" $WP_CONFIG
+sudo sed -i "s|define('WP_SITEURL', 'http://localhost');|define('WP_SITEURL', 'https://$DOMAIN');|" $WP_CONFIG
 
 # -------------------
 # CREATE CADDYFILE
@@ -131,7 +145,76 @@ $DOMAIN, www.$DOMAIN {
     tls $ADMIN_EMAIL
 }
 
-# Other services (ERP, docs, mail, etc.) can be added here as needed
+# ERP
+erp.$DOMAIN {
+    reverse_proxy http://$ERP_IP:$ERP_PORT {
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote}
+    }
+    log {
+        output file /var/log/caddy/erp.log
+    }
+}
+
+# Documentation
+docs.$DOMAIN {
+    reverse_proxy https://$DOCS_IP:$DOCS_PORT {
+        transport http {
+            tls_insecure_skip_verify
+        }
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote}
+    }
+    log {
+        output file /var/log/caddy/docs.log
+    }
+}
+
+# Mail
+mail.$DOMAIN {
+    reverse_proxy https://$MAIL_IP:$MAIL_PORT {
+        transport http {
+            tls_insecure_skip_verify
+        }
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote}
+    }
+    log {
+        output file /var/log/caddy/mail.log
+    }
+}
+
+# Nomogrow
+nomogrow.$DOMAIN {
+    reverse_proxy http://$NOMOGROW_IP:$NOMOGROW_PORT {
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote}
+    }
+    log {
+        output file /var/log/caddy/nomogrow.log
+    }
+}
+
+# Ventura-Tech
+ventura-tech.$DOMAIN {
+    reverse_proxy http://$VENTURA_IP:$VENTURA_PORT {
+        header_up Host {host}
+        header_up X-Forwarded-Proto {scheme}
+        header_up X-Forwarded-For {remote}
+    }
+    log {
+        output file /var/log/caddy/ventura-tech.log
+    }
+}
+
+# HTTP redirect to HTTPS (for debugging)
+http://$DOMAIN, http://www.$DOMAIN, http://erp.$DOMAIN, http://docs.$DOMAIN, http://mail.$DOMAIN, http://nomogrow.$DOMAIN, http://ventura-tech.$DOMAIN {
+    redir https://{host}{uri} permanent
+}
 EOF
 
 # -------------------
@@ -180,13 +263,23 @@ else
     sudo systemctl enable caddy
 fi
 
-# Check if MySQL is accessible
+# Check if MySQL is accessible using the non-root user
 echo "[INFO] Testing MySQL connectivity..."
 mysql -u $DB_USER -p$DB_PASS -h localhost -e "SHOW DATABASES;" > /dev/null
 if [ $? -eq 0 ]; then
     echo "[INFO] MySQL connection is successful."
 else
     echo "[ERROR] Unable to connect to MySQL. Check credentials and permissions."
+    exit 1
+fi
+
+# Validate that the correct database exists and has the necessary WordPress tables
+echo "[INFO] Checking that the WordPress database exists and has tables..."
+mysql -u $DB_USER -p$DB_PASS -e "USE $DB_NAME; SHOW TABLES;" > /dev/null
+if [ $? -eq 0 ]; then
+    echo "[INFO] Database $DB_NAME exists and contains tables."
+else
+    echo "[ERROR] Database $DB_NAME does not exist or does not contain the necessary tables!"
     exit 1
 fi
 
@@ -203,19 +296,6 @@ fi
 echo "[INFO] Checking PHP-FPM logs for errors..."
 sudo tail -n 20 /var/log/php8.3-fpm.log
 
-# Test if Caddy is properly serving WordPress
-echo "[INFO] Testing WordPress with Curl..."
-curl -s --head "https://$DOMAIN" | head -n 20
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN")
-if [ "$HTTP_STATUS" -eq 200 ]; then
-    echo "[INFO] WordPress is responsive (status code 200)."
-else
-    echo "[ERROR] WordPress is not responsive (status code: $HTTP_STATUS)."
-    exit 1
-fi
-
-# -------------------
-# COMPLETION
-# -------------------
-echo "[INFO] Migration complete. The WordPress site should now be available at https://$DOMAIN"
-
+# Test if Caddy is properly serving WordPress (reverse proxy test)
+echo "[INFO] Checking reverse proxy (Caddy) for WordPress..."
+RESPONSE_CODE=$(curl -s -o /dev/null -w "%{
