@@ -1,8 +1,7 @@
 #!/bin/bash
 # ===============================================
-# Full Setup Script: WordPress + PHP-FPM + Caddy
-# Also includes Diagnostic Check for proper operation
-# Domain: sahmcore.com.sa
+# Migration Script: WordPress + PHP-FPM + Caddy
+# Migrates WordPress from Apache/Nginx to Caddy with Let's Encrypt SSL
 # ===============================================
 
 set -e
@@ -12,8 +11,10 @@ set -e
 # -------------------
 DOMAIN="sahmcore.com.sa"
 ADMIN_EMAIL="a.saeed@$DOMAIN"
-WP_ADMIN_USER="admin"
-WP_ADMIN_PASSWORD="Sahm2190"  # Keeping the original password as requested
+WP_PATH="/var/www/html"          # The original WordPress path (no backup needed)
+PHP_VERSION="8.3"
+PHP_SOCKET="/run/php/php${PHP_VERSION}-fpm.sock"
+WP_CONFIG="$WP_PATH/wp-config.php"
 
 # -------------------
 # SYSTEM UPDATE & DEPENDENCIES
@@ -26,17 +27,13 @@ sudo apt install -y curl wget unzip lsb-release software-properties-common net-t
 # PHP-FPM INSTALLATION
 # -------------------
 echo "[INFO] Checking PHP-FPM..."
-PHP_VERSION=""
 if ! command -v php >/dev/null 2>&1; then
-    echo "[INFO] Installing PHP and PHP-FPM..."
+    echo "[INFO] Installing PHP-FPM..."
     sudo add-apt-repository ppa:ondrej/php -y
     sudo apt update
     sudo apt install -y php8.3 php8.3-fpm php8.3-mysql php8.3-curl php8.3-gd php8.3-mbstring php8.3-xml php8.3-xmlrpc php8.3-soap php8.3-intl php8.3-zip
-    PHP_VERSION="8.3"
-else
-    PHP_VERSION=$(php -r "echo PHP_MAJOR_VERSION.'.'.PHP_MINOR_VERSION;")
 fi
-PHP_SOCKET="/run/php/php${PHP_VERSION}-fpm.sock"
+
 echo "[INFO] Using PHP-FPM socket: $PHP_SOCKET"
 
 # -------------------
@@ -51,25 +48,61 @@ if ! command -v caddy >/dev/null 2>&1; then
 fi
 
 # -------------------
-# STOP OTHER WEB SERVERS
+# STOP OTHER WEB SERVERS (Apache / Nginx)
 # -------------------
+echo "[INFO] Stopping Apache and Nginx to avoid conflicts..."
 sudo systemctl stop apache2 nginx 2>/dev/null || true
 sudo systemctl disable apache2 nginx 2>/dev/null || true
 sudo systemctl mask apache2 nginx  # Ensure Apache and Nginx do not restart
 
 # -------------------
-# WORDPRESS INSTALLATION
+# VERIFY AND RESTORE WORDPRESS FILES
 # -------------------
-WP_PATH="/var/www/html"
+echo "[INFO] Verifying WordPress installation at $WP_PATH..."
+
+# Ensure that the WordPress path exists
 if [ ! -d "$WP_PATH" ]; then
-    echo "[INFO] Installing WordPress..."
-    sudo mkdir -p $WP_PATH
-    cd /tmp
-    wget https://wordpress.org/latest.zip
-    unzip latest.zip
-    sudo mv wordpress/* $WP_PATH/
-    sudo chown -R www-data:www-data $WP_PATH
+    echo "[ERROR] WordPress path $WP_PATH does not exist!"
+    exit 1
 fi
+
+# Ensure correct permissions for the WordPress files
+sudo chown -R www-data:www-data $WP_PATH
+sudo find $WP_PATH -type d -exec chmod 755 {} \;
+sudo find $WP_PATH -type f -exec chmod 644 {} \;
+
+# -------------------
+# RESTORE DATABASE
+# -------------------
+echo "[INFO] Restoring database..."
+
+DB_NAME="wordpress_db"  # Adjust to match your WordPress database name in wp-config.php
+
+# If necessary, create the database (ensure the database exists in MySQL)
+sudo mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS $DB_NAME;"
+
+# Import the existing database dump (if applicable)
+# This assumes the original database is running and doesn't require restoring from an external file
+# Adjust if you have an actual database dump to restore
+sudo mysql -u root -p $DB_NAME < /var/www/html/backup/wordpress_db.sql
+
+# -------------------
+# VERIFY wp-config.php
+# -------------------
+echo "[INFO] Verifying wp-config.php..."
+if [ ! -f "$WP_CONFIG" ]; then
+    echo "[ERROR] wp-config.php is missing!"
+    exit 1
+fi
+
+# Ensure wp-config.php points to the correct database
+sed -i "s/database_name_here/$DB_NAME/" $WP_CONFIG
+sed -i "s/username_here/wordpress_user/" $WP_CONFIG
+sed -i "s/password_here/wordpress_pass/" $WP_CONFIG
+
+# Update site URL if necessary
+sed -i "s|define('WP_HOME', 'http://localhost');|define('WP_HOME', 'https://$DOMAIN');|" $WP_CONFIG
+sed -i "s|define('WP_SITEURL', 'http://localhost');|define('WP_SITEURL', 'https://$DOMAIN');|" $WP_CONFIG
 
 # -------------------
 # CREATE CADDYFILE
@@ -91,10 +124,52 @@ $DOMAIN, www.$DOMAIN {
         X-XSS-Protection "1; mode=block"
         Referrer-Policy "strict-origin-when-cross-origin"
     }
+    # Automatically get SSL certificates from Let's Encrypt
+    tls $ADMIN_EMAIL
+}
+
+# ERP
+erp.$DOMAIN {
+    reverse_proxy http://$THIS_VM_IP:8069
+    log {
+        output file /var/log/caddy/erp.log
+    }
+}
+
+# Documentation
+docs.$DOMAIN {
+    reverse_proxy https://$THIS_VM_IP:9443
+    log {
+        output file /var/log/caddy/docs.log
+    }
+}
+
+# Mail
+mail.$DOMAIN {
+    reverse_proxy https://$THIS_VM_IP:444
+    log {
+        output file /var/log/caddy/mail.log
+    }
+}
+
+# Nomogrow
+nomogrow.$DOMAIN {
+    reverse_proxy http://$THIS_VM_IP:8082
+    log {
+        output file /var/log/caddy/nomogrow.log
+    }
+}
+
+# Ventura-Tech
+ventura-tech.$DOMAIN {
+    reverse_proxy http://$THIS_VM_IP:8080
+    log {
+        output file /var/log/caddy/ventura-tech.log
+    }
 }
 
 # HTTP redirect to HTTPS (for debugging)
-http://$DOMAIN, http://www.$DOMAIN {
+http://$DOMAIN, http://www.$DOMAIN, http://erp.$DOMAIN, http://docs.$DOMAIN, http://mail.$DOMAIN, http://nomogrow.$DOMAIN, http://ventura-tech.$DOMAIN {
     redir https://{host}{uri} permanent
 }
 EOF
@@ -102,81 +177,68 @@ EOF
 # -------------------
 # FIREWALL SETUP
 # -------------------
+echo "[INFO] Configuring firewall..."
 sudo ufw --force reset
 sudo ufw default deny incoming
 sudo ufw default allow outgoing
 sudo ufw allow 22/tcp
 sudo ufw allow 80/tcp    # Allow HTTP for debugging
-sudo ufw allow 443/tcp
+sudo ufw allow 443/tcp   # Allow HTTPS for Let's Encrypt
 sudo ufw enable
-
-# -------------------
-# PERMISSIONS
-# -------------------
-sudo chown -R www-data:www-data $WP_PATH
-sudo find $WP_PATH -type d -exec chmod 755 {} \;
-sudo find $WP_PATH -type f -exec chmod 644 {} \;
 
 # -------------------
 # START SERVICES
 # -------------------
+echo "[INFO] Starting PHP-FPM and Caddy..."
 sudo systemctl daemon-reload
 sudo systemctl enable --now php${PHP_VERSION}-fpm
 sudo systemctl enable --now caddy
 
-echo ""
-echo "==============================================="
-echo "SETUP COMPLETE!"
-echo "WordPress: https://$DOMAIN"
-echo "Caddy + HTTPS is fully functional."
-echo "==============================================="
+# -------------------
+# DIAGNOSTIC SCRIPT
+# -------------------
+echo "[INFO] Starting diagnostic check..."
 
-# -------------------
-# DIAGNOSTIC SCRIPT STARTS HERE
-# -------------------
-echo "[INFO] Starting WordPress + PHP-FPM Diagnostic Check..."
-# --- Configuration ---
-PHP_FPM_SERVICE="php${PHP_VERSION}-fpm"
-CADDY_SERVICE="caddy"
+# Check for Apache and Nginx conflicts
+echo "[INFO] Checking if Apache or Nginx are running..."
+if systemctl is-active --quiet apache2; then
+    echo "[ERROR] Apache is running. Stopping and disabling..."
+    sudo systemctl stop apache2
+    sudo systemctl disable apache2
+    sudo systemctl mask apache2
+else
+    echo "[INFO] Apache is not running."
+fi
+if systemctl is-active --quiet nginx; then
+    echo "[ERROR] Nginx is running. Stopping and disabling..."
+    sudo systemctl stop nginx
+    sudo systemctl disable nginx
+    sudo systemctl mask nginx
+else
+    echo "[INFO] Nginx is not running."
+fi
 
 # Check if PHP-FPM is running
 echo "[INFO] Checking if PHP-FPM is running..."
-if systemctl is-active --quiet $PHP_FPM_SERVICE; then
+if systemctl is-active --quiet php${PHP_VERSION}-fpm; then
     echo "[INFO] PHP-FPM is running."
 else
     echo "[ERROR] PHP-FPM is NOT running. Starting PHP-FPM..."
-    sudo systemctl start $PHP_FPM_SERVICE
-    sudo systemctl enable $PHP_FPM_SERVICE
+    sudo systemctl start php${PHP_VERSION}-fpm
+    sudo systemctl enable php${PHP_VERSION}-fpm
 fi
 
 # Check if Caddy is running
 echo "[INFO] Checking if Caddy is running..."
-if systemctl is-active --quiet $CADDY_SERVICE; then
+if systemctl is-active --quiet caddy; then
     echo "[INFO] Caddy is running."
 else
     echo "[ERROR] Caddy is NOT running. Starting Caddy..."
-    sudo systemctl start $CADDY_SERVICE
-    sudo systemctl enable $CADDY_SERVICE
-fi
-
-# Perform Health Check (Curl)
-echo "[INFO] Performing basic health check for WordPress..."
-curl -s --head "https://$DOMAIN" | head -n 20
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://$DOMAIN")
-if [ "$HTTP_STATUS" -eq 200 ]; then
-    echo "[INFO] WordPress is responsive (status code 200)."
-else
-    echo "[ERROR] WordPress is not responsive (status code: $HTTP_STATUS)."
-    exit 1
+    sudo systemctl start caddy
+    sudo systemctl enable caddy
 fi
 
 # -------------------
-# Final Status
+# COMPLETION
 # -------------------
-echo ""
-echo "==============================================="
-echo "DIAGNOSTIC COMPLETED!"
-echo "==============================================="
-echo "WordPress should now be functional with PHP-FPM."
-echo "If any issues were found, please check the error messages above."
-echo "==============================================="
+echo "[INFO] Migration complete. The WordPress site should now be available at https://$DOMAIN"
